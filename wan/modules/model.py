@@ -263,6 +263,8 @@ class WanT2VCrossAttention(WanSelfAttention):
 
         enable_nag = kwargs.get("enable_nag", False)
         nag_scale = kwargs.get("nag_scale", 1.0)
+        nag_tau = kwargs.get("nag_tau", 2.5)  # Official default
+        nag_alpha = kwargs.get("nag_alpha", 0.25)  # Official default
 
         positive_context = context[0] if isinstance(context, list) else context
         negative_context = context[1] if isinstance(context, list) and len(context) > 1 else None
@@ -288,7 +290,6 @@ class WanT2VCrossAttention(WanSelfAttention):
         Z_pos = pay_attention(qvl_list,  cross_attn= True)
 
         if enable_nag and negative_context is not None:
-            print("Calculating negative attention")
             # Negative attention
             k_neg = self.k(negative_context)
             self.norm_k(k_neg)
@@ -296,17 +297,27 @@ class WanT2VCrossAttention(WanSelfAttention):
             v_neg = self.v(negative_context).view(b, -1, n, d)
             v_neg = v_neg.contiguous().clone()
             qvl_neg = [q, k_neg, v_neg]
-            del q, k_neg, v_neg
+            del k_neg, v_neg
             Z_neg = pay_attention(qvl_neg, cross_attn=True)
 
-            # NAG blending
-            Z_extrap = Z_pos - Z_neg  # Difference to isolate negative influence
-            Z_norm = nn.functional.normalize(Z_extrap, p=2, dim=-1)  # Normalize (L2 norm common in NAG)
-            alpha = 0.5 * nag_scale  # Scale factor for blending
-            Z_final = alpha * Z_norm + (1 - alpha) * Z_pos  # Blend positive and normalized difference
+            # Official NAG blending
+            Z_guidance = Z_pos * nag_scale - Z_neg * (nag_scale - 1)
+            norm_pos = torch.norm(Z_pos, p=1, dim=-1, keepdim=True).expand_as(Z_pos)
+            norm_guidance = torch.norm(Z_guidance, p=1, dim=-1, keepdim=True).expand_as(Z_guidance)
+
+            scale = norm_guidance / (norm_pos + 1e-7)  # Avoid division by zero
+            scale = torch.nan_to_num(scale, 10)
+
+            # Apply threshold
+            mask = scale > nag_tau
+            Z_guidance[mask] = Z_guidance[mask] / (norm_guidance[mask] + 1e-7) * norm_pos[mask] * nag_tau
+
+            # Blend
+            Z_final = Z_guidance * nag_alpha + Z_pos * (1 - nag_alpha)
         else:
             Z_final = Z_pos
 
+        del q
         # output
         x = Z_final.flatten(2)
         x = self.o(x)
