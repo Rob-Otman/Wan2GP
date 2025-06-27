@@ -310,7 +310,7 @@ class WanT2VCrossAttention(WanSelfAttention):
 
             # Apply threshold
             mask = scale > nag_tau
-            Z_guidance[mask] = Z_guidance[mask] / (norm_guidance[mask] + 1e-7) * norm_pos[mask] * nag_tau
+            Z_guidance[mask] /= (norm_guidance[mask] + 1e-7) / (norm_pos[mask] * nag_tau)
 
             # Blend
             Z_final = Z_guidance * nag_alpha + Z_pos * (1 - nag_alpha)
