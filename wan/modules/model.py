@@ -288,6 +288,7 @@ class WanT2VCrossAttention(WanSelfAttention):
         qvl_list=[q, k, v]
         del k, v
         Z_pos = pay_attention(qvl_list,  cross_attn= True)
+        del qvl_list
 
         # Apply NAG selectively if enabled and negative context is provided
         if enable_nag and negative_context is not None:
@@ -298,20 +299,30 @@ class WanT2VCrossAttention(WanSelfAttention):
             k_neg = k_neg.view(nag_bsz, -1, n, d)
             v_neg = self.v(negative_context).view(nag_bsz, -1, n, d)
             qvl_neg = [q_neg, k_neg, v_neg]
+            del k_neg, v_neg
             Z_neg = pay_attention(qvl_neg, cross_attn=True)
-            Z_pos_neg = Z_pos[-nag_bsz:]  # Positive outputs for negative samples
-            Z_guidance = Z_pos_neg * nag_scale - Z_neg * (nag_scale - 1)
-            norm_pos = torch.norm(Z_pos_neg, p=1, dim=-1, keepdim=True).expand_as(Z_pos_neg)
-            norm_guidance = torch.norm(Z_guidance, p=1, dim=-1, keepdim=True).expand_as(Z_guidance)
+            del qvl_neg
+
+            Z_pos_neg = Z_pos[-nag_bsz:]
+            Z_guidance = Z_pos_neg.clone()
+            Z_guidance.mul_(nag_scale)
+            Z_neg_temp = Z_neg * (nag_scale - 1)
+            Z_guidance.sub_(Z_neg_temp)
+            del Z_neg_temp
+            norm_pos = torch.norm(Z_pos_neg, p=1, dim=-1, keepdim=True)
+            norm_guidance = torch.norm(Z_guidance, p=1, dim=-1, keepdim=True)
             scale = norm_guidance / (norm_pos + 1e-7)
             scale = torch.nan_to_num(scale, 10)
-            mask = scale > nag_tau
-            Z_guidance[mask] /= (norm_guidance[mask] + 1e-7) / (norm_pos[mask] * nag_tau)
-            Z_final_neg = Z_guidance * nag_alpha + Z_pos_neg * (1 - nag_alpha)
-            Z_final = torch.cat([Z_pos[:-nag_bsz], Z_final_neg], dim=0)
+            factor = torch.minimum(scale, torch.ones_like(scale) * nag_tau) / scale
+            Z_guidance *= factor
+            Z_guidance.mul_(nag_alpha).add_(Z_pos_neg * (1 - nag_alpha))
+            Z_final = torch.cat([Z_pos[:-nag_bsz], Z_guidance], dim=0)
+            del Z_pos, Z_neg, Z_pos_neg, Z_guidance
         else:
             Z_final = Z_pos
+            del Z_pos
 
+        del q
         # Output projection
         x = Z_final.flatten(2)
         x = self.o(x)
