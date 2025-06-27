@@ -263,8 +263,8 @@ class WanT2VCrossAttention(WanSelfAttention):
 
         enable_nag = kwargs.get("enable_nag", False)
         nag_scale = kwargs.get("nag_scale", 1.0)
-        nag_tau = kwargs.get("nag_tau", 2.5)  # Official default
-        nag_alpha = kwargs.get("nag_alpha", 0.25)  # Official default
+        nag_tau = kwargs.get("nag_tau", 3.5)  # Official default
+        nag_alpha = kwargs.get("nag_alpha", 0.5)  # Official default
 
         positive_context = context[0] if isinstance(context, list) else context
         negative_context = context[1] if isinstance(context, list) and len(context) > 1 else None
@@ -289,36 +289,30 @@ class WanT2VCrossAttention(WanSelfAttention):
         del k, v
         Z_pos = pay_attention(qvl_list,  cross_attn= True)
 
+        # Apply NAG selectively if enabled and negative context is provided
         if enable_nag and negative_context is not None:
-            # Negative attention
+            nag_bsz = negative_context.size(0)
+            q_neg = q[-nag_bsz:]  # Queries for negative samples: [nag_bsz, L1, num_heads, head_dim]
             k_neg = self.k(negative_context)
             self.norm_k(k_neg)
-            k_neg = k_neg.view(b, -1, n, d)
-            v_neg = self.v(negative_context).view(b, -1, n, d)
-            v_neg = v_neg.contiguous().clone()
-            qvl_neg = [q, k_neg, v_neg]
-            del k_neg, v_neg
+            k_neg = k_neg.view(nag_bsz, -1, n, d)
+            v_neg = self.v(negative_context).view(nag_bsz, -1, n, d)
+            qvl_neg = [q_neg, k_neg, v_neg]
             Z_neg = pay_attention(qvl_neg, cross_attn=True)
-
-            # Official NAG blending
-            Z_guidance = Z_pos * nag_scale - Z_neg * (nag_scale - 1)
-            norm_pos = torch.norm(Z_pos, p=1, dim=-1, keepdim=True).expand_as(Z_pos)
+            Z_pos_neg = Z_pos[-nag_bsz:]  # Positive outputs for negative samples
+            Z_guidance = Z_pos_neg * nag_scale - Z_neg * (nag_scale - 1)
+            norm_pos = torch.norm(Z_pos_neg, p=1, dim=-1, keepdim=True).expand_as(Z_pos_neg)
             norm_guidance = torch.norm(Z_guidance, p=1, dim=-1, keepdim=True).expand_as(Z_guidance)
-
-            scale = norm_guidance / (norm_pos + 1e-7)  # Avoid division by zero
+            scale = norm_guidance / (norm_pos + 1e-7)
             scale = torch.nan_to_num(scale, 10)
-
-            # Apply threshold
             mask = scale > nag_tau
             Z_guidance[mask] /= (norm_guidance[mask] + 1e-7) / (norm_pos[mask] * nag_tau)
-
-            # Blend
-            Z_final = Z_guidance * nag_alpha + Z_pos * (1 - nag_alpha)
+            Z_final_neg = Z_guidance * nag_alpha + Z_pos_neg * (1 - nag_alpha)
+            Z_final = torch.cat([Z_pos[:-nag_bsz], Z_final_neg], dim=0)
         else:
             Z_final = Z_pos
 
-        del q
-        # output
+        # Output projection
         x = Z_final.flatten(2)
         x = self.o(x)
         return x
