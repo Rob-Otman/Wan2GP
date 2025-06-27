@@ -257,8 +257,18 @@ class WanT2VCrossAttention(WanSelfAttention):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
-            context(Tensor): Shape [B, L2, C]
+            context (list[Tensor]): List of context tensors, where context[0] is the positive
+                context [B, L2, C] and context[1] (if present) is the negative context [B, L2, C]
         """
+
+        enable_nag = kwargs.get("enable_nag", False)
+        nag_scale = kwargs.get("nag_scale", 1.0)
+        nag_tau = kwargs.get("nag_tau", 3.5)  # Official default
+        nag_alpha = kwargs.get("nag_alpha", 0.5)  # Official default
+
+        positive_context = context[0] if isinstance(context, list) else context
+        negative_context = context[1] if isinstance(context, list) and len(context) > 1 else None
+
         x = xlist[0]
         xlist.clear()
         b, n, d = x.size(0), self.num_heads, self.head_dim
@@ -268,19 +278,42 @@ class WanT2VCrossAttention(WanSelfAttention):
         del x
         self.norm_q(q)
         q= q.view(b, -1, n, d)
-        k = self.k(context)
+        k = self.k(positive_context)
         self.norm_k(k)
         k = k.view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+        v = self.v(positive_context).view(b, -1, n, d)
 
         # compute attention
         v = v.contiguous().clone()
         qvl_list=[q, k, v]
-        del q, k, v
-        x = pay_attention(qvl_list,  cross_attn= True)
+        del k, v
+        Z_pos = pay_attention(qvl_list,  cross_attn= True)
 
-        # output
-        x = x.flatten(2)
+        # Apply NAG selectively if enabled and negative context is provided
+        if enable_nag and negative_context is not None:
+            nag_bsz = negative_context.size(0)
+            q_neg = q[-nag_bsz:]  # Queries for negative samples: [nag_bsz, L1, num_heads, head_dim]
+            k_neg = self.k(negative_context)
+            self.norm_k(k_neg)
+            k_neg = k_neg.view(nag_bsz, -1, n, d)
+            v_neg = self.v(negative_context).view(nag_bsz, -1, n, d)
+            qvl_neg = [q_neg, k_neg, v_neg]
+            Z_neg = pay_attention(qvl_neg, cross_attn=True)
+            Z_pos_neg = Z_pos[-nag_bsz:]  # Positive outputs for negative samples
+            Z_guidance = Z_pos_neg * nag_scale - Z_neg * (nag_scale - 1)
+            norm_pos = torch.norm(Z_pos_neg, p=1, dim=-1, keepdim=True).expand_as(Z_pos_neg)
+            norm_guidance = torch.norm(Z_guidance, p=1, dim=-1, keepdim=True).expand_as(Z_guidance)
+            scale = norm_guidance / (norm_pos + 1e-7)
+            scale = torch.nan_to_num(scale, 10)
+            mask = scale > nag_tau
+            Z_guidance[mask] /= (norm_guidance[mask] + 1e-7) / (norm_pos[mask] * nag_tau)
+            Z_final_neg = Z_guidance * nag_alpha + Z_pos_neg * (1 - nag_alpha)
+            Z_final = torch.cat([Z_pos[:-nag_bsz], Z_final_neg], dim=0)
+        else:
+            Z_final = Z_pos
+
+        # Output projection
+        x = Z_final.flatten(2)
         x = self.o(x)
         return x
 
@@ -423,6 +456,7 @@ class WanAttentionBlock(nn.Module):
         audio_proj= None,
         audio_context_lens= None,
         audio_scale=None,
+        **kwargs
     ):
         r"""
         Args:
@@ -436,7 +470,7 @@ class WanAttentionBlock(nn.Module):
         dtype = x.dtype
 
         if self.block_id is not None and hints is not None:
-            kwargs = { 
+            args = {
                 "grid_sizes" : grid_sizes,
                 "freqs" :freqs, 
                 "context" : context,
@@ -447,7 +481,7 @@ class WanAttentionBlock(nn.Module):
                 if scale == 0:
                     hints_processed.append(None)
                 else:
-                    hints_processed.append(self.vace(hint, x, **kwargs) if self.block_id == 0 else self.vace(hint, None, **kwargs))
+                    hints_processed.append(self.vace(hint, x, **args) if self.block_id == 0 else self.vace(hint, None, **args))
                      
         latent_frames = e.shape[0]
         e = (self.modulation + e).chunk(6, dim=1)
@@ -480,7 +514,7 @@ class WanAttentionBlock(nn.Module):
         y = y.to(attention_dtype)
         ylist= [y]
         del y
-        x += self.cross_attn(ylist, context, grid_sizes, audio_proj, audio_scale, audio_context_lens).to(dtype)
+        x += self.cross_attn(ylist, context, grid_sizes, audio_proj, audio_scale, audio_context_lens, **kwargs).to(dtype)
 
         y = self.norm2(x)
 
@@ -963,7 +997,8 @@ class WanModel(ModelMixin, ConfigMixin):
         audio_proj=None,
         audio_context_lens=None,
         audio_scale=None,
-
+        nag_scale=None,
+        enable_nag=False
     ):
         # patch_dtype =  self.patch_embedding.weight.dtype
         modulation_dtype = self.time_projection[1].weight.dtype
@@ -1062,6 +1097,8 @@ class WanModel(ModelMixin, ConfigMixin):
             block_mask = block_mask,
             audio_proj=audio_proj,
             audio_context_lens=audio_context_lens,
+            nag_scale=nag_scale,
+            enable_nag=enable_nag
             )
 
         if vace_context == None:
@@ -1127,10 +1164,13 @@ class WanModel(ModelMixin, ConfigMixin):
                         continue
                     x_list[0] = block(x_list[0], context = context_list[0], e= e0, **kwargs)
                 else:
-                    for i, (x, context, hints, audio_scale) in enumerate(zip(x_list, context_list, hints_list, audio_scale_list)):
-                        x_list[i] = block(x, context = context, hints= hints, audio_scale= audio_scale, e= e0, **kwargs)
-                        del x
-                    del context, hints
+                    if enable_nag:
+                        x_list[0] = block(x_list[0], context=context_list, hints= hints_list[0], audio_scale= audio_scale_list[0], e=e0, **kwargs)
+                    else:
+                        for i, (x, context, hints, audio_scale) in enumerate(zip(x_list, context_list, hints_list, audio_scale_list)):
+                            x_list[i] = block(x, context = context, hints= hints, audio_scale= audio_scale, e= e0, **kwargs)
+                            del x
+                        del context, hints
 
             if self.enable_cache:
                 if joint_pass:

@@ -339,6 +339,8 @@ class WanT2V:
                 sampling_steps=50,
                 guide_scale=5.0,
                 n_prompt="",
+                enable_nag=False,
+                nag_scale=1.0,
                 seed=-1,
                 offload_model=True,
                 callback = None,
@@ -497,7 +499,13 @@ class WanT2V:
         else:
             freqs = get_rotary_pos_embed(latents.shape[1:], enable_RIFLEx= enable_RIFLEx) 
 
-        kwargs = {'freqs': freqs, 'pipeline': self, 'callback': callback}
+        kwargs = {
+            'freqs': freqs,
+            'pipeline': self,
+            'callback': callback,
+            'nag_scale': nag_scale,
+            'enable_nag': enable_nag
+        }
 
         if target_camera != None:
             kwargs.update({'cam_emb': cam_emb})
@@ -545,7 +553,8 @@ class WanT2V:
             kwargs["current_step"] = i 
             kwargs["t"] = timestep 
             if guide_scale == 1:
-                noise_pred = self.model( [latent_model_input], x_id = 0, context = [context], **kwargs)[0]
+                context_list = [context, context_null] if enable_nag and n_prompt else [context]
+                noise_pred = self.model( [latent_model_input], x_id = 0, context = context_list, **kwargs)[0]
                 if self._interrupt:
                     return None
             elif joint_pass:

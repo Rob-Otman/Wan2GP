@@ -1811,7 +1811,9 @@ def get_default_settings(model_type):
                 "slg_switch": 0,
                 "slg_layers": [9],
                 "slg_start_perc": 10,
-                "slg_end_perc": 90
+                "slg_end_perc": 90,
+                "enable_nag": False,
+                "nag_scale": 1.0
             }
 
             if model_type in ["hunyuan","hunyuan_i2v"]:
@@ -1873,7 +1875,6 @@ def get_default_settings(model_type):
                 ui_defaults.update({
                     "sliding_window_discard_last_frames": 0,
                 })
-            
 
         with open(defaults_filename, "w", encoding="utf-8") as f:
             json.dump(ui_defaults, f, indent=4)
@@ -3160,7 +3161,9 @@ def generate_video(
     task,
     send_cmd,
     prompt,
-    negative_prompt,    
+    negative_prompt,
+    enable_nag,
+    nag_scale,
     resolution,
     video_length,
     seed,
@@ -3693,6 +3696,8 @@ def generate_video(
                     guide_scale=guidance_scale,
                     embedded_guidance_scale=embedded_guidance_scale,
                     n_prompt=negative_prompt,
+                    enable_nag=enable_nag,
+                    nag_scale=nag_scale,
                     seed=seed,
                     callback=callback,
                     enable_RIFLEx = enable_RIFLEx,
@@ -4810,6 +4815,8 @@ def save_inputs(
             lset_name,
             prompt,
             negative_prompt,
+            enable_nag,
+            nag_scale,
             resolution,
             video_length,
             seed,
@@ -5053,6 +5060,13 @@ def refresh_preview(state):
     preview = gen.get("preview", None)
     return preview
 
+def update_nag_visibility(guidance_scale):
+    cfg_1 = guidance_scale == 1
+    return gr.Checkbox(visible=cfg_1)
+
+def update_slider_visibility(enable_nag):
+    return gr.Row(visible=enable_nag), gr.Slider(visible=enable_nag)
+
 def init_process_queue_if_any(state):                
     gen = get_gen_info(state)
     if bool(gen.get("queue",[])):
@@ -5116,7 +5130,7 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
     if update_form:
         model_filename = state_dict["model_filename"]
         model_type = state_dict["model_type"]
-        advanced_ui = state_dict["advanced"]  
+        advanced_ui = state_dict["advanced"]
     else:
         model_type = transformer_type
         model_filename = get_model_filename(model_type, transformer_quantization, transformer_dtype_policy)
@@ -5536,6 +5550,8 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
             with gr.Tabs(visible=advanced_ui) as advanced_row:
                 # with gr.Row(visible=advanced_ui) as advanced_row:
                 with gr.Tab("Generation"):
+                    g_scale = ui_defaults.get("guidance_scale",5)
+                    nag_enabled = ui_defaults.get("enable_nag", False)
                     with gr.Column():
                         seed = gr.Slider(-1, 999999999, value=ui_defaults["seed"], step=1, label="Seed (-1 for random)") 
                         with gr.Row():
@@ -5547,13 +5563,17 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
                                 ], visible= test_class_i2v(model_type), label= "Multiple Images as Texts Prompts"
                             )
                         with gr.Row(visible = not ltxv):
-                            guidance_scale = gr.Slider(1.0, 20.0, value=ui_defaults.get("guidance_scale",5), step=0.5, label="Guidance Scale", visible=not (hunyuan_t2v or hunyuan_i2v))
+                            guidance_scale = gr.Slider(1.0, 20.0, value=g_scale, step=0.5, label="Guidance Scale", visible=not (hunyuan_t2v or hunyuan_i2v))
                             audio_guidance_scale = gr.Slider(1.0, 20.0, value=ui_defaults.get("audio_guidance_scale",5), step=0.5, label="Audio Guidance", visible=fantasy)
                             embedded_guidance_scale = gr.Slider(1.0, 20.0, value=6.0, step=0.5, label="Embedded Guidance Scale", visible=(hunyuan_t2v or hunyuan_i2v))
                             flow_shift = gr.Slider(0.0, 25.0, value=ui_defaults.get("flow_shift",3), step=0.1, label="Shift Scale") 
                         with gr.Row(visible = vace):
                             control_net_weight = gr.Slider(0.0, 2.0, value=ui_defaults.get("control_net_weight",1), step=0.1, label="Control Net Weight #1", visible=vace)
                             control_net_weight2 = gr.Slider(0.0, 2.0, value=ui_defaults.get("control_net_weight2",1), step=0.1, label="Control Net Weight #2", visible=vace)
+                        with gr.Row(visible = g_scale == 1):
+                            enable_nag = gr.Checkbox(label="Enable NAG (Normalized Attention Guidance)", value=nag_enabled, visible = g_scale == 1)
+                        with gr.Row(visible = g_scale == 1 and nag_enabled) as nag_scale_row:
+                            nag_scale = gr.Slider(0.01, 10.0, value=ui_defaults.get("nag_scale", 1.0), step=0.01, label="NAG Scale", visible=g_scale == 1 and enable_nag)
                         with gr.Row():
                             negative_prompt = gr.Textbox(label="Negative Prompt", value=ui_defaults.get("negative_prompt", "") )
                 with gr.Tab("Loras"):
@@ -5804,6 +5824,9 @@ def generate_video_tab(update_form = False, state_dict = None, ui_defaults = Non
             refresh_lora_btn2.click(refresh_lora_list, inputs=[state, lset_name,loras_choices], outputs=[lset_name, loras_choices])
             output.select(select_video, state, None )
             preview_trigger.change(refresh_preview, inputs= [state], outputs= [preview])
+
+            guidance_scale.change(fn=update_nag_visibility, inputs=guidance_scale, outputs=enable_nag)
+            enable_nag.change(fn=update_slider_visibility, inputs=enable_nag, outputs=[nag_scale_row, nag_scale])
 
             def refresh_status_async(state, progress=gr.Progress()):
                 gen = get_gen_info(state)
